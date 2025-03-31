@@ -6,7 +6,6 @@ import numpy as np
 from tqdm import tqdm
 from typing import List, Dict
 from sklearn.neighbors import KDTree
-
 from utils.core import *
 import utils.config as cfg
 from utils.tools import imshow
@@ -19,7 +18,7 @@ from datasets.MulRanDataset import MulRanPointCloudLoader
 from datasets.OxfordRadarDataset import OxfordRadarPointCloudLoader
 
 from evaluation.plot_pose_errors import plot_cdf
-from evaluation.plot_PR_curve import compute_PR_pairs
+from evaluation.plot_curve import calculate_dist
 from evaluation.generate_evaluation_sets import EvaluationSet, EvaluationTuple
 
 
@@ -80,95 +79,78 @@ def evaluate(dataset, eval_set_filepath: str, revisit_thresholds: List[float] = 
     assert os.path.exists(eval_set_filepath), f'Cannot access evaluation set pickle: {eval_set_filepath}'
     eval_set = EvaluationSet()
     eval_set.load(eval_set_filepath)
-    
-    map_set = eval_set.map_set
     query_set = eval_set.query_set
-
-    map_pcs, map_bevs, map_RINGs, map_TIRINGs = generate_representations(dataset, map_set, bev_type)
-    query_pcs, query_bevs, query_RINGs, query_TIRINGs = generate_representations(dataset, query_set, bev_type)
-    
-    C, H, W = map_bevs[0].shape
-
-    map_xys = eval_set.get_map_positions()
-    map_poses = eval_set.get_map_poses()
-    num_maps = len(map_xys)
-    print(f"No. maps: {num_maps}")
-    
-    tree = KDTree(map_xys)
-
     query_xys = eval_set.get_query_positions()
     query_poses = eval_set.get_query_poses()
     num_queries = len(query_xys)
-    print(f"No. queries: {num_queries}")
+    query_pcs, query_bevs, query_RINGs, query_TIRINGs = generate_representations(dataset, query_set, bev_type)
     
-    recalls_k = np.zeros((len(revisit_thresholds), num_k)) # Recall@k
-    recalls_one_percent = np.zeros(len(revisit_thresholds)) # Recall@1% (recall when 1% of the database is retrieved)
-    threshold = max(int(round(num_maps/100.0)), 1) # Recall@1% threshold
-    pair_dists = np.zeros((num_queries, num_maps))
+
+    pair_dists =np.zeros((num_queries-cfg.exclude_recent_nodes, 3))
     rot_errors = np.zeros((len(revisit_thresholds), num_queries)) # rotation errors
     trans_errors = np.zeros((len(revisit_thresholds), num_queries))  # translation errors
     icp_rot_errors = np.zeros((len(revisit_thresholds), num_queries))  # rotation errors after ICP
     icp_trans_errors = np.zeros((len(revisit_thresholds), num_queries))  # translation errors after ICP    
-    for query_ndx in tqdm(range(num_queries)):
+    
+    for query_ndx in tqdm(range(cfg.exclude_recent_nodes,num_queries)):
         query_xy = query_xys[query_ndx]
         query_pose = query_poses[query_ndx]
         query_pc = query_pcs[query_ndx]
         query_bev = query_bevs[query_ndx]
-        query_RING = query_RINGs[query_ndx]
+
+        C, H, W = query_bevs[0].shape
+
         query_TIRING = query_TIRINGs[query_ndx]
         query_TIRING_repeated = query_TIRING.repeat(cfg.batch_size, 1, 1, 1)
         
         # ------------ Place Recognition ------------
-        if num_maps % cfg.batch_size == 0:
-            batch_num = num_maps // cfg.batch_size
+        if (query_ndx -cfg.exclude_recent_nodes+1) % cfg.batch_size == 0:
+            batch_num = (query_ndx -cfg.exclude_recent_nodes+1)// cfg.batch_size
         else:
-            batch_num = num_maps // cfg.batch_size + 1      
+            batch_num = (query_ndx -cfg.exclude_recent_nodes+1) // cfg.batch_size + 1     
+        print(f"query_index/total_queries: {query_ndx+1}/{num_queries}")
         for i in range(batch_num):
+            
             if i == batch_num - 1:
-                map_TIRING = [map_TIRINGs[k] for k in range(i*cfg.batch_size, num_maps)]
-                map_TIRING = torch.stack(map_TIRING, dim=0).reshape((-1, C, H, W))
-                query_TIRING_repeated = query_TIRING.repeat(map_TIRING.shape[0], 1, 1, 1)
+                history_TIRING = [query_TIRINGs[k] for k in range(i*cfg.batch_size, query_ndx -cfg.exclude_recent_nodes+1)]
+                history_TIRING = torch.stack(history_TIRING, dim=0).reshape((-1, C, H, W))
+                query_TIRING_repeated = query_TIRING.repeat(history_TIRING.shape[0], 1, 1, 1)
             else:
-                map_TIRING = [map_TIRINGs[k] for k in range(i*cfg.batch_size, (i+1)*cfg.batch_size)]
-                map_TIRING = torch.stack(map_TIRING, dim=0).reshape((-1, C, H, W))
-            # batch_dists, batch_angles = fast_corr(query_TIRING_repeated, map_TIRING)
-            batch_dists, batch_angles = batch_circorr(query_TIRING_repeated, map_TIRING)
+                history_TIRING = [query_TIRINGs[k] for k in range(i*cfg.batch_size, (i+1)*cfg.batch_size)] 
+                history_TIRING = torch.stack(history_TIRING, dim=0).reshape((-1, C, H, W))
+           
+            batch_dists, batch_angles = batch_circorr(query_TIRING_repeated, history_TIRING)
+            
             if i == 0:
                 dists = batch_dists
                 angles = batch_angles
             else:
                 dists = np.concatenate((dists, batch_dists), axis=-1)
                 angles = np.concatenate((angles, batch_angles), axis=-1)
-
+        
         dists = dists.squeeze()
-        angles = angles.squeeze()          
-        pair_dists[query_ndx] = dists
-        dists_sorted = np.sort(dists)
+        angles = angles.squeeze() 
+
+        if  dists.ndim == 0: 
+           dists=np.array([dists]) # 标量 
+        
         idxs_sorted = np.argsort(dists)
         idx_top1 = idxs_sorted[0]
-        for j, revisit_threshold in enumerate(revisit_thresholds):
-            true_neighbors = tree.query_radius(query_xy.reshape(1,-1), revisit_threshold)[0]
-            # Recall@k
-            for k in range(num_k):
-                # if np.linalg.norm(map_xys[idxs_sorted[k]] - query_xy) < revisit_threshold:
-                if idxs_sorted[k] in true_neighbors:
-                    recalls_k[j, k] += 1
-                    break
-            # Recall@1%
-            if len(list(set(idxs_sorted[0:threshold]).intersection(set(true_neighbors)))) > 0:
-                recalls_one_percent[j] += 1     
-
-            # ------------ Pose Estimation ------------
+        pair_dists[query_ndx - cfg.exclude_recent_nodes] = [query_ndx,idx_top1,dists[idx_top1]] 
+        
+         # ------------ Pose Estimation ------------
              # Perform pose estimation for the top 1 match within the revisit threshold
-            if idx_top1 in true_neighbors:
-                map_pose = map_poses[idx_top1]
-                map_pc = map_pcs[idx_top1]
-                map_bev = map_bevs[idx_top1]
+        for j, revisit_threshold in enumerate(revisit_thresholds): 
+            distance = calculate_dist(query_xy, query_xys[idx_top1]) 
+            if  distance< revisit_threshold:
+                history_pose = query_poses[idx_top1]
+                history_pc = query_pcs[idx_top1]
+                history_bev = query_bevs[idx_top1]
                 angle_matched = angles[idx_top1]
-                rel_pose = relative_pose(query_pose, map_pose)
+                rel_pose = relative_pose(query_pose, history_pose)
                 gt_x, gt_y, gt_z, gt_yaw, gt_pitch, gt_roll = m2xyz_ypr(rel_pose)
-                print(f"-------- Query {query_ndx+1} matched with map {idx_top1+1} --------")
-                print("Ground truth translation: x: {}, y: {}, rotation: {}".format(gt_x, gt_y, gt_yaw))
+                #print(f"-------- Query {query_ndx+1}th frame matched with history {idx_top1+1}th frame--------")
+                #print("Ground truth translation: x: {}, y: {}, rotation: {}".format(gt_x, gt_y, gt_yaw))
 
                 ang_res = 2 * np.pi / cfg.num_ring # angular resolution
                 # angle between the two matched RINGs in grids
@@ -181,8 +163,8 @@ def evaluate(dataset, eval_set_filepath: str, revisit_thresholds: List[float] = 
                 bev_rotated_extra = rotate_bev(query_bev, angle_matched_extra_rad)
 
                 # solve the translation between the two matched bevs
-                x, y, error = solve_translation(bev_rotated, map_bev)
-                x_extra, y_extra, error_extra = solve_translation(bev_rotated_extra, map_bev)
+                x, y, error = solve_translation(bev_rotated, history_bev)
+                x_extra, y_extra, error_extra = solve_translation(bev_rotated_extra, history_bev)
 
                 if error < error_extra:
                     pred_x = x / cfg.num_sector * (cfg.point_cloud["x_bound"][1] - cfg.point_cloud["x_bound"][0])  # in meters
@@ -193,7 +175,7 @@ def evaluate(dataset, eval_set_filepath: str, revisit_thresholds: List[float] = 
                     pred_y = y_extra / cfg.num_ring * (cfg.point_cloud["y_bound"][1] - cfg.point_cloud["y_bound"][0])  # in meters 
                     pred_yaw = angle_matched_extra_rad  # in radians
                 
-                print("Estimated translation: x: {}, y: {}, rotation: {}".format(pred_x, pred_y, pred_yaw))
+               # print("RING Estimated translation: x: {}, y: {}, rotation: {}".format(pred_x, pred_y, pred_yaw))
 
                 yaw_err = np.abs(angle_clip(gt_yaw - pred_yaw)) * 180 / np.pi # in degrees
                 x_err = np.abs(gt_x - pred_x) # in meters
@@ -205,27 +187,16 @@ def evaluate(dataset, eval_set_filepath: str, revisit_thresholds: List[float] = 
                 # ------------ Pose Refinement ------------
                 init_pose = xyz_ypr2m(pred_x, pred_y, 0, pred_yaw, 0, 0)
                 times = time.time()
-                icp_fitness_score, loop_transform = fast_gicp(query_pc, map_pc, max_correspondence_distance=cfg.icp_max_distance, init_pose=init_pose)
+                icp_fitness_score, loop_transform = fast_gicp(query_pc,history_pc, max_correspondence_distance=cfg.icp_max_distance, init_pose=init_pose)
                 # icp_fitness_score, loop_transform, _ = o3d_icp(query_pc, map_pc, transform=init_pose, point2plane=True, inlier_dist_threshold=cfg.icp_max_distance)
-                timee = time.time()    
+                #  timee = time.time()    
                 # print("ICP processed time:", timee - times, 's')
-
                 x, y, z, yaw, pitch, roll = m2xyz_ypr(loop_transform)
-                print("Refined translation: x: {}, y: {}, rotation: {}".format(x, y, yaw))
+               # print("fast_gicp Refined translation: x: {}, y: {}, rotation: {}".format(x, y, yaw))
 
                 icp_rte, icp_rre = cal_pose_error(loop_transform, rel_pose)
                 icp_rot_errors[j, query_ndx] = icp_rre
                 icp_trans_errors[j, query_ndx] = icp_rte
-
-
-    thresholds1 = np.linspace(0, 0.35, 10) 
-    thresholds2 = np.linspace(0.35, 0.55, 80)
-    thresholds3 = np.linspace(0.55, 1, 10)
-    thresholds = np.concatenate((thresholds1, thresholds2, thresholds3))   
-    precisions_all = np.zeros((len(revisit_thresholds), len(thresholds)))
-    recalls_all = np.zeros((len(revisit_thresholds), len(thresholds)))
-    f1s_all = np.zeros((len(revisit_thresholds), len(thresholds))) 
-    quantiles = [0.25, 0.5, 0.75, 0.95]
     
     eval_setting = eval_set_filepath.split('/')[-1].split('.pickle')[0]
     folder = f"./results/{dataset}/{eval_setting}/revisit"
@@ -233,48 +204,25 @@ def evaluate(dataset, eval_set_filepath: str, revisit_thresholds: List[float] = 
         folder = f"{folder}_{revisit_threshold}"
     if not os.path.exists(folder):
         os.makedirs(folder)
+    # used for drawing pr curve
+    np.savetxt(f'{folder}/pair_dists.txt', pair_dists, fmt="%d %d %.6f")
+    np.savetxt(f'{folder}/poses.txt',query_xys, fmt="%.6f")
+    
+    
+     # ------------ Pose Error ------------ 
+    mean_rot_error = np.mean(rot_errors[j])
+    mean_trans_error = np.mean(trans_errors[j])
+    mean_icp_rot_error = np.mean(icp_rot_errors[j])
+    mean_icp_trans_error = np.mean(icp_trans_errors[j])    
+       
+    print(f"Mean rotation error at {revisit_threshold} m: {mean_rot_error}")    
+    print(f"Mean translation error at {revisit_threshold} m: {mean_trans_error}")
+    print(f"Mean icp rotation error at {revisit_threshold} m: {mean_icp_rot_error}")    
+    print(f"Mean icp translation error at {revisit_threshold} m: {mean_icp_trans_error}")    
+    
 
-    for j, revisit_threshold in enumerate(revisit_thresholds):
-        # ------------ Recall@k and Recall@1% ------------
-        recalls_k[j] = np.cumsum(recalls_k[j])/num_queries
-        recalls_one_percent[j] = recalls_one_percent[j]/num_queries
-        print(f"-------- Revisit threshold: {revisit_threshold} m --------")
-        print(f"Recall@{num_k} at {revisit_threshold} m: {recalls_k[j]}")
-        print(f"Recall@1% at {revisit_threshold} m: {recalls_one_percent[j]}")
-
-        # ------------ PR Curve ------------
-        save_path = f'{folder}/precision_recall_curve_{bev_type}_{revisit_threshold}m.pdf'
-        precisions, recalls, f1s = compute_PR_pairs(pair_dists, query_xys, map_xys, thresholds=thresholds, save_path=save_path, revisit_threshold=revisit_threshold)
-        precisions_all[j] = precisions
-        recalls_all[j] = recalls
-        f1s_all[j] = f1s
-
-        # ------------ Pose Error ------------ 
-        mean_rot_error = np.mean(rot_errors[j])
-        mean_trans_error = np.mean(trans_errors[j])
-        mean_icp_rot_error = np.mean(icp_rot_errors[j])
-        mean_icp_trans_error = np.mean(icp_trans_errors[j])    
-        rot_error_quantiles = np.quantile(rot_errors[j], quantiles)
-        trans_error_quantiles = np.quantile(trans_errors[j], quantiles)
-        icp_rot_error_quantiles = np.quantile(icp_rot_errors[j], quantiles)
-        icp_trans_error_quantiles = np.quantile(icp_trans_errors[j], quantiles)    
-        print(f"Mean rotation error at {revisit_threshold} m: {mean_rot_error}")    
-        print(f"Mean translation error at {revisit_threshold} m: {mean_trans_error}")
-        print(f"Mean icp rotation error at {revisit_threshold} m: {mean_icp_rot_error}")    
-        print(f"Mean icp translation error at {revisit_threshold} m: {mean_icp_trans_error}")    
-        print(f"Rotation error quantiles at {revisit_threshold} m: {rot_error_quantiles}")
-        print(f"Translation error quantiles at {revisit_threshold} m: {trans_error_quantiles}")
-        print(f"ICP rotation error quantiles at {revisit_threshold} m: {icp_rot_error_quantiles}")
-        print(f"ICP translation error quantiles at {revisit_threshold} m: {icp_trans_error_quantiles}")
-
-        save_path = f'{folder}/rot_error_cdf_{bev_type}_{revisit_threshold}m.pdf'
-        plot_cdf(rot_errors[j], save_path=save_path, xlabel='Rotation Error (degrees)', ylabel='CDF', title='Rotation error CDF')
-
-    np.savetxt(f'{folder}/recalls_k_{bev_type}.txt', recalls_k)
-    np.savetxt(f'{folder}/recalls_one_percent_{bev_type}.txt', recalls_one_percent)
-    np.savetxt(f'{folder}/precisions_{bev_type}.txt', precisions_all)
-    np.savetxt(f'{folder}/recalls_{bev_type}.txt', recalls_all)
-    np.savetxt(f'{folder}/f1s_{bev_type}.txt', f1s_all)
+    save_path = f'{folder}/rot_error_cdf_{bev_type}_{revisit_threshold}m.pdf'
+    plot_cdf(rot_errors[j], save_path=save_path, xlabel='Rotation Error (degrees)', ylabel='CDF', title='Rotation error CDF')
     np.savetxt(f'{folder}/rot_errors_{bev_type}.txt', rot_errors)
     np.savetxt(f'{folder}/trans_errors_{bev_type}.txt', trans_errors)
     np.savetxt(f'{folder}/icp_rot_errors_{bev_type}.txt', icp_rot_errors)
@@ -290,10 +238,9 @@ if __name__ == '__main__':
     parser.add_argument('--bev_type', type=str, default="occ", help='BEV type (occ / feat)')
     args = parser.parse_args()
 
-    print(f'Dataset: {args.dataset}')
-    print(f'Evaluation set path: {args.eval_set_filepath}')
-    print(f'Revisit thresholds [m]: {args.revisit_thresholds}')
-    print(f'Number of nearest neighbors for recall@k: {args.num_k}')
-    print(f'BEV type: {args.bev_type}')
+    print(f'Dataset:\033[34m {args.dataset}\033[0m')
+    print(f'Evaluation set path: \033[34m{args.eval_set_filepath}\033[0m')
+    print(f'Revisit thresholds [m]:\033[34m{args.revisit_thresholds}\033[0m')
+    print(f'BEV type:\033[34m{args.bev_type}\033[0m')
 
     evaluate(args.dataset, args.eval_set_filepath, args.revisit_thresholds, num_k=args.num_k, bev_type=args.bev_type)
