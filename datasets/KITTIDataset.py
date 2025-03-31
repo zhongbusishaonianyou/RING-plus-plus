@@ -159,8 +159,9 @@ class KITTISequence(Dataset):
         print(f'Number of global poses: {n}')
         system_timestamps = np.genfromtxt(self.times_file)
         poses = np.zeros((n, 4, 4), dtype=np.float32)       # 4x4 pose matrix
-
+        
         for ndx, pose in enumerate(pose_data):
+
             # Split by comma and remove whitespaces
             temp = [e.strip() for e in pose.split(' ')]
             assert len(temp) == 12, f'Invalid line in global poses file: {temp}'
@@ -170,7 +171,7 @@ class KITTISequence(Dataset):
                                     [float(temp[8]), float(temp[9]), float(temp[10]), float(temp[11])],
                                     [0., 0., 0., 1.]])
             poses[ndx] = np.linalg.inv(calib) @ (poses[ndx] @ calib)
-
+        
         # List LiDAR scan timestamps
         all_lidar_timestamps = [int(os.path.splitext(f)[0]) for f in os.listdir(self.lidar_path) if
                                 os.path.splitext(f)[1] == '.bin']
@@ -181,21 +182,23 @@ class KITTISequence(Dataset):
         lidar_filepaths = []
         lidar_poses = []
         count_rejected = 0
-
+       # np.savetxt(f'lidar_xys.txt', all_lidar_timestamps, fmt='%f')
         for ndx, lidar_ts in enumerate(all_lidar_timestamps):
             # Find index of the closest timestamp
-            closest_ts_ndx = find_nearest_ndx(lidar_ts, system_timestamps)
-            delta = abs(system_timestamps[closest_ts_ndx] - lidar_ts)
+            #closest_ts_ndx = find_nearest_ndx(lidar_ts, system_timestamps)
+
+           # delta = abs(system_timestamps[closest_ts_ndx] - lidar_ts)
             # Timestamp is in nanoseconds = 1e-9 second
-            if delta > self.pose_time_tolerance * 1000000000:
+           # if delta > self.pose_time_tolerance * 1000000000:
                 # Reject point cloud without corresponding pose
-                count_rejected += 1
-                continue
-
-            lidar_timestamps.append(lidar_ts)
-            lidar_filepaths.append(os.path.join(self.lidar_path, f'{lidar_ts}.bin'))
-            lidar_poses.append(poses[closest_ts_ndx])
-
+            # count_rejected += 1
+           #     continue
+            #print(lidar_ts)
+           
+            lidar_timestamps.append(ndx)      
+            lidar_filepaths.append(os.path.join(self.lidar_path, f'{str(ndx+1).zfill(5)}.bin'))     
+            lidar_poses.append(poses[ndx])
+       
         lidar_timestamps = np.array(lidar_timestamps, dtype=np.int64)
         lidar_filepaths = np.array(lidar_filepaths)
         lidar_poses = np.array(lidar_poses, dtype=np.float32)     # 4x4 pose matrix
@@ -211,25 +214,28 @@ class KITTISequence(Dataset):
             lidar_filepaths = lidar_filepaths[mask]
             lidar_poses = lidar_poses[mask]
             lidar_xys = lidar_xys[mask]
-
+        
         # Sample lidar scans 
         prev_position = None
         mask = []
+        
         for ndx, position in enumerate(lidar_xys):
+           # print(position)
             if prev_position is None:
                 mask.append(ndx)
-                prev_position = position
-            else:
-                displacement = np.linalg.norm(prev_position - position)
+                prev_position = position  
+                
+            else:                      
+                displacement = np.linalg.norm(position-prev_position)
                 if displacement > self.sampling_distance:
-                    mask.append(ndx)
-                    prev_position = position
-
+                 mask.append(ndx)
+                 prev_position = position 
+               
         lidar_timestamps = lidar_timestamps[mask]
         lidar_filepaths = lidar_filepaths[mask]
         lidar_poses = lidar_poses[mask]
         lidar_xys = lidar_xys[mask]
-
+        #print(lidar_xys.shape)
         print(f'{len(lidar_timestamps)} scans with valid pose, {count_rejected} rejected due to unknown pose')
         return lidar_timestamps, lidar_filepaths, lidar_poses, lidar_xys
 
