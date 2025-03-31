@@ -39,7 +39,9 @@ NOTE: You may need to change the path of the results in the script.
 |![Figure_24](https://github.com/user-attachments/assets/283b0555-e4e0-483e-8e88-24e00e54fde2)|![Figure_13](https://github.com/user-attachments/assets/f04ee11c-2ea0-4f57-8c7a-1f25488a5fe7)|
 |![Figure_14](https://github.com/user-attachments/assets/8df08481-bf18-441a-b97d-b3c32e8a7fb8)|![Figure_15](https://github.com/user-attachments/assets/a27302d8-df21-4c1f-94d8-8d2ddb2eee1c)|
 |![Figure_16](https://github.com/user-attachments/assets/95f8facc-2515-434b-a570-5a5edb356600)| ![Figure_17](https://github.com/user-attachments/assets/81531d08-f3ee-45a1-bf80-1ffdf230c408)|
-## Citation
+# result analysis
+In fact, what we have shown above is the result of a single channel utilizing a RING that occupies information. According to the experimental results, RING performs better with a larger sampling interval.The main advantage of RING is that it can handle revisits with large lateral translation and has a relatively accurate estimation of the three-degree-of-freedom pose.
+# Citation
 If you find this work useful, please cite:
 ```bibtex
 @article{xu2023ring++,
